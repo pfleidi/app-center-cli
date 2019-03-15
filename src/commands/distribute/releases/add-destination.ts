@@ -1,4 +1,4 @@
-import { AppCommand, CommandResult, ErrorCodes, failure, help, success, shortName, longName, required, hasArg } from "../../../util/commandline";
+import { AppCommand, CommandResult, ErrorCodes, failure, help, success, shortName, longName, required, hasArg, defaultValue } from "../../../util/commandline";
 import { AppCenterClient, models, clientRequest, ClientResponse } from "../../../util/apis";
 import { out } from "../../../util/interaction";
 import { inspect } from "util";
@@ -6,6 +6,8 @@ import * as _ from "lodash";
 import { DefaultApp } from "../../../util/profile";
 
 const debug = require("debug")("appcenter-cli:commands:distribute:releases:add-destination");
+
+type DestinationType = "group" | "tester";
 
 const ValidDestinationTypes = ["group", "tester"];
 
@@ -33,6 +35,16 @@ export default class AddDestinationCommand extends AppCommand {
   @hasArg
   public destination: string;
 
+  @help("Mandatory")
+  @shortName("m")
+  @longName("mandatory")
+  public mandatory: boolean;
+
+  @help("Silent")
+  @shortName("s")
+  @longName("silent")
+  public silent: boolean;
+
   public async run(client: AppCenterClient): Promise<CommandResult> {
     const app: DefaultApp = this.app;
 
@@ -44,39 +56,75 @@ export default class AddDestinationCommand extends AppCommand {
     if (ValidDestinationTypes.indexOf(this.destinationType) === -1) {
       return failure(ErrorCodes.InvalidParameter, `${this.destinationType} is not a valid destination type. Available types are: ${ValidDestinationTypes.join(", ")}`);
     }
-    debug("Distributing the release");
-    if (this.destinationType == "group") {
-      await this.reDistributeGroup(client, app, releaseId, );
+    const destinationType = this.destinationType as DestinationType;
 
+    let distributionGroupId: string;
+    if (destinationType === "group") {
+      try {
+        debug("Getting group details");
+        const group = await out.progress(`Loading group details...`,
+          clientRequest<models.DistributionGroupResponse>(async (cb) => client.distributionGroups.get(app.ownerName, app.appName, this.destination, cb)));
 
+        if (group.response.statusCode >= 400) {
+          throw { statusCode: group.response.statusCode };
+        }
 
-    } else if (this.destinationType == "tester") {
+        if (!group.result) {
+          throw { statusCode: 404 };
+        }
 
+        distributionGroupId = group.result.id;
+      } catch (error) {
+        if (error.statusCode === 404) {
+          throw failure(ErrorCodes.InvalidParameter, `distribution group "${this.destination}" was not found`);
+        } else {
+          debug(`Failed to get distribution group - ${inspect(error)}`);
+          throw failure(ErrorCodes.Exception, `failed to get distribution group "${this.destination}"`);
+        }
+      }
     }
 
-    // TODO: Actually call client to add destination ; this is blocked on https://msmobilecenter.visualstudio.com/Mobile-Center/_git/appcenter/pullrequest/24972
+    debug("Distributing the release");
+    await this.reDistributeGroup(
+      client,
+      app,
+      releaseId,
+      destinationType,
+      destinationType === "group" ? distributionGroupId : this.destination,
+      this.mandatory,
+      !this.silent
+    );
 
+    out.text(`Release ${this.releaseId} was distributed to ${this.destinationType} "${this.destination}"`);
     return success();
   }
 
-  private async reDistributeGroup(client: AppCenterClient, app: DefaultApp, releaseId: number, mandatoryUpdate: boolean = false, notifyTesters: boolean= true): Promise<models.ReleaseDetailsResponse> {
+  private async reDistributeGroup(client: AppCenterClient, app: DefaultApp, releaseId: number, destinationType: DestinationType, destination: string, mandatoryUpdate: boolean = false, notifyTesters: boolean = true): Promise<models.ReleaseDetailsResponse> {
     let updateReleaseRequestResponse: ClientResponse<models.ReleaseDetailsResponse>;
     try {
-      updateReleaseRequestResponse = await out.progress(`Distributing the release...`,
-        clientRequest<models.ReleaseDetailsResponse>(async (cb) => client.releases.addDistributionGroup(releaseId, app.ownerName, app.appName, "groupId", {
-          mandatoryUpdate: false,
-          notifyTesters: false,
-        }, cb)));
+      if (destinationType === "group") {
+        updateReleaseRequestResponse = await out.progress(`Distributing the release...`,
+          clientRequest<models.ReleaseDetailsResponse>(async (cb) => client.releases.addDistributionGroup(releaseId, app.ownerName, app.appName, destination, {
+            mandatoryUpdate,
+            notifyTesters,
+          }, cb)));
+      } else {
+        updateReleaseRequestResponse = await out.progress(`Distributing the release...`,
+          clientRequest<models.ReleaseDetailsResponse>(async (cb) => client.releases.addTesters(releaseId, app.ownerName, app.appName, destination, {
+            mandatoryUpdate,
+            notifyTesters,
+          }, cb)));
+      }
       const statusCode = updateReleaseRequestResponse.response.statusCode;
       if (statusCode >= 400) {
-        throw statusCode;
+        throw { statusCode };
       }
     } catch (error) {
-      if (error === 400) {
-        throw failure(ErrorCodes.Exception, "errorr message");
+      if (error.statusCode === 404) {
+        throw failure(ErrorCodes.InvalidParameter, `release "${this.releaseId}" was not found`);
       } else {
         debug(`Failed to distribute the release - ${inspect(error)}`);
-        throw failure(ErrorCodes.Exception, `failed to set distribution group and release notes for release ${releaseId}`);
+        throw failure(ErrorCodes.Exception, `failed to set ${this.destinationType} "${this.destination}" for release ${releaseId}`);
       }
     }
 
